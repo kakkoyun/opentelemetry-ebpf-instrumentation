@@ -385,3 +385,136 @@ docs/rules.md, docs/configuration.md, docs/benchmarking.md, ADR-0004/0005, issue
 roadmap), #665 (go get broken), #570 (overhead SLO), #644/#556 (version drift); OTel blog
 "go-compile-time-instrumentation" (2025); alibaba/loongsuite-go-agent (supported-libraries.md,
 compilation-time.md, context-propagation.md); OTel community issue #2344 (donation, overhead figures).
+
+---
+
+## 6. Addendum: adversarial review — corrections and blind spots (2026-07-10)
+
+After the report above was written, a 5-lens adversarial review (OBI code re-sweep, otelc
+red-team, ecosystem sweep, hostile re-read of this report, first-principles dimension analysis)
+produced 44 raw findings; 12 were selected and independently verified by refutation-oriented
+skeptics. **11 confirmed, 1 plausible, 0 refuted.** They correct this report in several places.
+Context updates: otelc is about to cut v1.0, and Datadog's Orchestrion has proven the toolexec
+model in production — the maturity framing below supersedes §0/§4.
+
+### 6.1 Corrections to this report
+
+1. **"OBI is production" is wrong for this repo.** OBI's own `README.md:12` says *"OBI is
+   currently in Development… expect breaking changes between minor releases while the project
+   remains in v0"*; `VERSIONING.md`: "All current OBI user-facing surfaces are unstable by
+   default"; latest release v0.10.0 (2026-06-30), GA targeted late 2026. The honest framing is
+   **symmetric**: both OTel repos are pre-GA v0.x donations from production-proven lineages
+   (Grafana Beyla ↔ loongsuite-go-agent/Orchestrion).
+2. **The headline "TLS injection works for exactly one runtime: Go" has an unstated
+   precondition**: `SupportsContextPropagationWithProbe()` requires **CAP_SYS_ADMIN and kernel
+   `lockdown=none`** (`pkg/ebpf/common/common.go:516-540`; unreadable lockdown file → treated as
+   integrity). Secure-Boot distros default to `lockdown=integrity`, so on such fleets
+   `bpf_probe_write_user` paths early-return and **no runtime gets TLS header injection** — Go
+   degrades to TCP option 25 like everyone else.
+3. **"Manual + auto span interop categorically impossible for OBI" is overstated.** OBI uprobes
+   the OTel *API* (`global.(*tracer).Start`, `nonRecordingSpan.End/SetStatus/SetAttributes/
+   RecordError`, and `go.opentelemetry.io/auto/sdk`) for Go apps with no SDK installed
+   (`bpf/gotracer/go_sdk.c`, `gotracer.go:660-697`): manual spans nest bidirectionally with eBPF
+   spans, with attributes, status, and errors. Caveats: only within an eBPF-tracked request
+   (standalone root manual spans are dropped), bounded fidelity, and a delegate check skips apps
+   that installed a real SDK.
+4. **The §4 row "Internal spans, errors, business attrs: No" is materially misleading.** OBI
+   synthesizes "in queue"/"processing" sub-spans and extracts application-semantic attributes
+   from payloads — including a full **GenAI layer** (OpenAI/Anthropic/Gemini/Qwen/Bedrock spans
+   with token usage incl. cache/reasoning tokens, tool calls, opt-in prompt/response capture —
+   `tracesgen.go:603-1005`), MCP/JSON-RPC, and opt-in header/body attributes. Developer-defined
+   in-code attributes remain impossible for non-Go.
+5. **This report judged a multi-signal system on the traces axis only.** Missing entirely:
+   GPU/CUDA kernel-launch telemetry (`bpf/gpuevent/`), netolly flow metrics and statsolly
+   kernel-truth TCP stats (SRTT/retransmits — signals that survive even when L7 parsing fails, so
+   "entirely dark" for unsupported TLS stacks is true only at L7), **trace-log correlation**
+   (logenricher writes trace IDs into app log buffers via `bpf_probe_write_user` — also widening
+   §2.7's write-primitive surface beyond Go), and **trace-profile correlation** (pinned
+   `traces_ctx_v1` map). For LLM-heavy shops, zero-code GenAI spans from Python services
+   materially shift the complement-vs-competitor calculus.
+
+### 6.2 Missed comparison dimensions
+
+6. **Messaging context propagation — arguably a bigger practical gap than TLS.** OBI cannot
+   propagate through Kafka/MQTT/AMQP at all (`SUPPORT_MATRIX.md:73-75`: Context propagation = No;
+   `go_kafka_go.c` tracks traceparents in maps only, never writes message headers; TCP option 25
+   is per-connection and dies at the broker). Producer→consumer traces **always** fragment in
+   event-driven architectures. Compile-time injects W3C context into message headers via SDK
+   propagators (otelc kafka-go hooks; loongsuite: 4× Kafka, RocketMQ, RabbitMQ, MQTT).
+7. **Platform classes where eBPF is impossible and compile-time is trivial** (plausible,
+   evidence-backed): Fargate/Lambda/Cloud Run (eBPF-disabled environments), Windows containers,
+   macOS dev. GKE Autopilot is nuanced: privileged DaemonSets are allowlist-gated and Beyla is
+   allowlisted, but the vendor-neutral OBI image is not (yet). §5's "run OBI fleet-wide" is not
+   executable on these platforms.
+
+### 6.3 Unknown unknowns on the compile-time side (pre-v1.0 relevance)
+
+8. **GLS mis-parents across requests via pooled goroutine workers — same failure class as eBPF
+   thread reuse, undocumented.** GLS copies parent→child only in `runtime.newproc1`
+   (`instrumentation/runtime/otelc.yaml`). A pool worker lazily spawned under request A's span
+   keeps A's span in its GLS clone forever (span End only cleans the ending goroutine's GLS;
+   `ClearTraceContext` has zero callers). Every later task on that worker that starts a span from
+   `context.Background()` gets A as parent via `afterSpanFromContext` (`trace/hook.go:15-22`) —
+   **cross-request contamination (wrong link), worse than OBI's missing link**, plus the
+   recordingSpan pinned in memory for the worker's lifetime. Loongsuite's dedicated `goants-v2`
+   plugin is the admission that spawn-time copy doesn't cover pools; otelc has no pool rule and
+   no doc. The §3.1 claim that GLS "solves" what OBI approximates is too strong: **any approach
+   that infers causality from execution-unit identity inherits the reuse failure class** —
+   threads for eBPF, pooled goroutines for GLS.
+9. **The GLS fallback rewrites `trace.SpanFromContext` semantics program-wide.** Intentional
+   root spans (`tracer.Start(context.Background(), …)`) inside any goroutine with non-empty GLS
+   silently become children of the ambient span; no runtime opt-out is documented
+   (`OTEL_GO_DISABLED_INSTRUMENTATIONS` doesn't gate the GLS hooks; `//otelc:ignore` is only
+   planned, #469; `trace.WithNewRoot()` works but isn't documented as the escape). Above
+   `OTEL_GLS_MAX_SPANS` (default 1000), `add()` fails **silently** (no log/metric), `tail()`
+   returns a wrong-but-valid parent, and `End()` still pays an O(n) linked-list walk — a hidden
+   CPU cliff precisely under overload. Neither overflow nor re-parenting semantics are in
+   `docs/configuration.md`.
+10. **otelc doesn't fingerprint itself into Go's build cache.** Go derives compile-action cache
+    keys from the toolexec wrapper's `-V=full` output; Orchestrion intercepts it
+    (`internal/toolexec/version.go`) to invalidate caches when tooling/config changes. otelc has
+    no `-V` handling; its substitute (private GOCACHE at `.otelc-build/gocache`) is bypassed
+    whenever the user sets GOCACHE (`setup.go:415-433` "respect it") — common in Docker cache
+    mounts and CI. Then `go build` and `otelc go build` share identical action IDs: plain builds
+    can link instrumented runtime objects and instrumented builds can silently reuse
+    uninstrumented packages; rule edits and otelc upgrades never invalidate anything. **The
+    classic production toolexec bug, already solved upstream in Orchestrion.**
+11. **"Vendoring support" (PR #616, merged 2026-07-09) silently builds with `-mod=mod`**,
+    rewriting explicit `-mod=vendor`, resolving from the network module cache while `vendor/` is
+    left untouched — announced by one info-level log line. Hermetic/air-gapped vendored builds
+    stop being hermetic, and compiled dependency code can diverge from the audited `vendor/`
+    tree (local patches). This ships at GA as-is.
+12. **No machine-checkable "expected instrumentation present" gate exists or is on the v1.0
+    roadmap** — `match.go` warns only when *zero* rules match; a Renovate bump past one rule's
+    version ceiling shrinks `matched.json` silently and spans vanish with nothing to bisect. The
+    v1.0 CLI/env freeze (#261) makes fail-by-default a breaking change later; an additive
+    `verify`/`doctor` command remains possible but shipping 1.0 without one cements silent
+    degradation as the frozen default.
+
+### 6.4 Interop: what actually happens when both run
+
+13. **OBI suppresses ALL its telemetry for SDK-exporting services BY DEFAULT** —
+    `exclude_otel_instrumented_services` defaults to **true** (`pkg/obi/config.go:304`), so §5's
+    recommendation 3 ("suppress… " as if opt-in) had it backwards. Detection is *behavioral*:
+    first observed successful OTLP export flips the service (`span.go:1873`), which means
+    (a) duplicate telemetry until first successful export — forever for short-lived jobs or
+    failing exporters; (b) suppression is all-or-nothing per signal: one traces export silences
+    OBI's SQL/Redis/Kafka/DNS spans that otelc's ~12-library rule set does not cover — **adopting
+    otelc on a service can net-reduce its observability** unless the flag is tuned;
+    (c) false-positive path: any successful gRPC call to port 4317 can flag a service;
+    (d) false-negative path: exporters on pre-OBI connections to code-configured ports duplicate
+    permanently. Span-metrics suppression is a separate default-false flag; detection events are
+    visible in the `obi_avoided_services` internal metric.
+
+### 6.5 The structural insight
+
+The strongest pattern across all findings: **every zero-effort context-propagation mechanism is a
+heuristic keyed on execution-unit identity, and every one of them fails when execution units are
+reused.** eBPF fails at thread/epoch granularity (missing links); GLS fails at pooled-goroutine
+granularity (wrong links — contamination). The only non-heuristic propagation is explicit
+`context.Context` threading — the very thing auto-instrumentation exists to avoid. The two
+approaches don't differ in *whether* they approximate causality, only in how often the
+approximation breaks, and whether it breaks by fragmenting a trace or by corrupting one.
+Fragmentation is visible; contamination is not — which is an argument for otelc to invest in
+pool-aware rules and GLS diagnostics before broad adoption, and for OBI to keep its
+wrong-link-avoidance bias (skip same-PID matches) even at the cost of more missing links.
