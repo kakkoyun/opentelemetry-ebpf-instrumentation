@@ -506,7 +506,43 @@ model in production — the maturity framing below supersedes §0/§4.
     permanently. Span-metrics suppression is a separate default-false flag; detection events are
     visible in the `obi_avoided_services` internal metric.
 
-### 6.5 The structural insight
+### 6.5 Follow-up: does Orchestrion + dd-trace-go share the GLS contamination bug? (No.)
+
+Audited by cloning both repos and walking the pooled-worker scenario through both stacks
+(verdict independently re-derived by two adversarial reviewers; all converged). **The confirmed
+otelc contamination is structurally impossible in Orchestrion + dd-trace-go, because dd-trace-go
+performs no GLS transfer at goroutine spawn at all.** The load-bearing difference is the transfer
+point: otelc's sole propagation site is a `runtime.newproc1` hook (parent→child clone);
+dd-trace-go's only runtime aspects are the `runtime.g` field/accessors and a `goexit1` hook that
+nils the slot on goroutine exit (`internal/orchestrion/gls.orchestrion.yml`) — no newproc rule,
+no `go`-statement join point exists in Orchestrion's injector. A pool worker starts with empty
+GLS; a `context.Background()` task on it yields a genuine **root span (missing link), not a
+wrong-parent link**. Cleanup is engineered in three layers: `GLSDeactivate` prepended to
+`span.Finish` (goroutine-scoped, idempotent popper), lazy reclaim of cross-goroutine-finished
+entries on the holder's next Push, and `goexit1` nil-ing. Explicit context always beats GLS
+(dd-trace-go #4528). Docs frame goroutine-boundary trace splits as expected behavior.
+
+Residual failure modes in the same family (all bounded, unlike otelc's): (a) same-goroutine
+root-span override — GLS-derived ChildOf even overrides an explicit caller ChildOf, with no
+force-root escape; (b) a one-shot contamination window because `Peek` does not skip
+reclaimable entries between a cross-goroutine Finish and the holder's next Push (fix in flight,
+dd-trace-go #4927); (c) a never-finished span on a pooled worker reproduces otelc-style permanent
+contamination — but requires an app bug (missing Finish), whereas otelc contaminates under fully
+correct code; (d) historical high-RPS GLS heap pinning (orchestrion #782, fixed by #4410) and a
+recycled-span ABA hazard currently prevented by force-disabling the span pool under Orchestrion
+(#4891). One unexplained field report of cross-request trace merging exists against older
+versions (dd-trace-go #3845). Caveat: code evidence is from current main; releases predating
+#4528/#4410/#4891 had strictly worse semantics.
+
+**Lineage split, made explicit:** the GLS family has two design philosophies. SkyWalking-Go /
+loongsuite / otelc chose spawn-time inheritance — better zero-touch coverage, wrong-link
+contamination under worker reuse, hence loongsuite's dedicated pool plugins (goants-v1/v2).
+Datadog chose no inheritance — missing links at goroutine boundaries (documented), no pool
+plugins needed, contamination requires an app bug. otelc inherited Alibaba's propagation model
+without the pool mitigations; before broad adoption it needs either End-time/exit-time cleanup
+discipline (Datadog-style) or pool-aware rules plus GLS diagnostics.
+
+### 6.6 The structural insight
 
 The strongest pattern across all findings: **every zero-effort context-propagation mechanism is a
 heuristic keyed on execution-unit identity, and every one of them fails when execution units are
